@@ -92,6 +92,16 @@ type tryGetResult struct {
 	ok   bool
 }
 
+// bufferState holds the internal, mutable state of the buffer, managed exclusively by the run goroutine.
+type bufferState struct {
+	realItems        []DataItem
+	displayItems     []DataItem
+	lastReadItem     DataItem
+	streamOutputChan chan<- DataItem
+	opts             options
+	size             int
+}
+
 // --- Buffer Implementation ---
 
 // Buffer is a thread-safe, fixed-size buffer for time-stamped data. It serializes
@@ -142,126 +152,141 @@ func New(size int, opts ...Option) *Buffer {
 // run is the manager goroutine that owns and manages the buffer state. It is the
 // only goroutine that ever accesses the internal slices, which guarantees thread-safety.
 func (b *Buffer) run() {
-	// realItems holds the original data points added to the buffer.
-	realItems := make([]DataItem, 0, b.size)
-	// displayItems is the smoothed, filled slice that consumers actually see.
-	displayItems := make([]DataItem, 0, b.size)
-	var streamOutputChan chan<- DataItem
-	var lastReadItem DataItem // For read continuity
-
-	// createRef is a helper to safely call the Ref() method if the item implements it.
-	createRef := func(item DataItem) DataItem {
-		if item == nil {
-			return nil
-		}
-		if ref, ok := item.(Referenceable); ok {
-			return ref.Ref()
-		}
-		return item
-	}
-
-	// rebuildDisplayBuffer recalculates the user-facing slice based on the real items
-	// and the configured drop/fill strategies.
-	rebuildDisplayBuffer := func() {
-		realItems = applyDropStrategy(realItems, b.size, b.opts.dropStrategy)
-		displayItems = applyFillStrategy(realItems, b.size, b.opts.fillStrategy)
+	state := &bufferState{
+		realItems:    make([]DataItem, 0, b.size),
+		displayItems: make([]DataItem, 0, b.size),
+		opts:         b.opts,
+		size:         b.size,
 	}
 
 	for {
-		// This first select block handles the case where the buffer has items to serve
-		// or can provide a continuity item.
-		if len(displayItems) > 0 || (b.opts.readContinuity && lastReadItem != nil) {
-			select {
-			case item := <-b.addChan:
-				realItems = append(realItems, item)
-				rebuildDisplayBuffer()
-			case newItems := <-b.addAllChan:
-				realItems = append(realItems, newItems...)
-				rebuildDisplayBuffer()
-			case respChan := <-b.getOldestChan:
-				if len(displayItems) > 0 {
-					itemToReturn := displayItems[0]
-					lastReadItem = itemToReturn
-					respChan <- itemToReturn
-					// Getting an item consumes the oldest "real" data point.
-					if len(realItems) > 0 {
-						realItems = realItems[1:]
-					}
-					rebuildDisplayBuffer()
-				} else {
-					// Buffer is empty, but we can provide a continuity item.
-					respChan <- createRef(lastReadItem)
-				}
-			case respChan := <-b.tryGetOldestChan:
-				if len(displayItems) > 0 {
-					itemToReturn := displayItems[0]
-					lastReadItem = itemToReturn
-					respChan <- tryGetResult{item: itemToReturn, ok: true}
-					if len(realItems) > 0 {
-						realItems = realItems[1:]
-					}
-					rebuildDisplayBuffer()
-				} else {
-					// Buffer is empty, provide continuity item.
-					respChan <- tryGetResult{item: createRef(lastReadItem), ok: true}
-				}
-			case respChan := <-b.getAllChan:
-				if len(displayItems) == 0 {
-					respChan <- nil
-				} else {
-					respChan <- displayItems
-				}
-				// GetAll is a destructive read.
-				realItems = make([]DataItem, 0, b.size)
-				displayItems = make([]DataItem, 0, b.size)
-			case reqChan := <-b.registerStreamChan:
-				streamOutputChan = reqChan
-			case streamOutputChan <- func() DataItem {
-				if len(displayItems) > 0 {
-					itemToSend := displayItems[0]
-					lastReadItem = itemToSend
-					return itemToSend
-				}
-				// Provide continuity item to stream if buffer is empty.
-				return createRef(lastReadItem)
-			}():
-				// If we sent a real item, remove it from the source list.
-				if len(displayItems) > 0 && len(realItems) > 0 {
-					realItems = realItems[1:]
-				}
-				rebuildDisplayBuffer()
-			case respChan := <-b.lenChan:
-				respChan <- len(displayItems)
-			case <-b.quitChan:
-				cleanup(realItems, streamOutputChan)
-				return
+		// To reduce complexity, we use a single select block. Channels that should not be
+		// active are set to nil, which effectively disables their case statements.
+		var oldestChan chan chan DataItem
+		var streamChan chan<- DataItem
+		var streamValue DataItem
+
+		canServe := len(state.displayItems) > 0 || (state.opts.readContinuity && state.lastReadItem != nil)
+		if canServe {
+			oldestChan = b.getOldestChan
+			streamChan = state.streamOutputChan
+			if len(state.displayItems) > 0 {
+				streamValue = state.displayItems[0]
+			} else {
+				streamValue = state.createRef(state.lastReadItem)
 			}
-		} else {
-			// This second select block handles the case where the buffer is completely empty
-			// and has no last-read item to provide for continuity.
-			select {
-			case item := <-b.addChan:
-				realItems = append(realItems, item)
-				rebuildDisplayBuffer()
-			case newItems := <-b.addAllChan:
-				realItems = append(realItems, newItems...)
-				rebuildDisplayBuffer()
-			case respChan := <-b.tryGetOldestChan:
-				// No items and no continuity possible, so fail the request.
-				respChan <- tryGetResult{item: nil, ok: false}
-			case respChan := <-b.getAllChan:
-				respChan <- nil
-			case reqChan := <-b.registerStreamChan:
-				streamOutputChan = reqChan
-			case respChan := <-b.lenChan:
-				respChan <- 0
-			case <-b.quitChan:
-				cleanup(realItems, streamOutputChan)
-				return
-			}
+		}
+
+		select {
+		case item := <-b.addChan:
+			state.handleAdd(item)
+		case newItems := <-b.addAllChan:
+			state.handleAddAll(newItems)
+		case respChan := <-oldestChan: // Will be nil if buffer can't serve
+			state.handleGetOldest(respChan)
+		case respChan := <-b.tryGetOldestChan:
+			state.handleTryGetOldest(respChan)
+		case respChan := <-b.getAllChan:
+			state.handleGetAll(respChan)
+		case reqChan := <-b.registerStreamChan:
+			state.streamOutputChan = reqChan
+		case streamChan <- streamValue: // Will be nil if buffer can't serve
+			state.handleStreamSend()
+		case respChan := <-b.lenChan:
+			respChan <- len(state.displayItems)
+		case <-b.quitChan:
+			cleanup(state.realItems, state.streamOutputChan)
+			return
 		}
 	}
 }
+
+// --- State Handlers ---
+
+// rebuildDisplayBuffer recalculates the user-facing slice based on the real items
+// and the configured drop/fill strategies.
+func (s *bufferState) rebuildDisplayBuffer() {
+	s.realItems = applyDropStrategy(s.realItems, s.size, s.opts.dropStrategy)
+	s.displayItems = applyFillStrategy(s.realItems, s.size, s.opts.fillStrategy)
+}
+
+// createRef is a helper to safely call the Ref() method if the item implements it.
+func (s *bufferState) createRef(item DataItem) DataItem {
+	if item == nil {
+		return nil
+	}
+	if ref, ok := item.(Referenceable); ok {
+		return ref.Ref()
+	}
+	return item
+}
+
+func (s *bufferState) handleAdd(item DataItem) {
+	s.realItems = append(s.realItems, item)
+	s.rebuildDisplayBuffer()
+}
+
+func (s *bufferState) handleAddAll(items []DataItem) {
+	s.realItems = append(s.realItems, items...)
+	s.rebuildDisplayBuffer()
+}
+
+func (s *bufferState) handleGetOldest(respChan chan DataItem) {
+	if len(s.displayItems) > 0 {
+		itemToReturn := s.displayItems[0]
+		s.lastReadItem = itemToReturn
+		respChan <- itemToReturn
+		if len(s.realItems) > 0 {
+			s.realItems = s.realItems[1:]
+		}
+		s.rebuildDisplayBuffer()
+	} else {
+		// Buffer is empty, but we can provide a continuity item.
+		respChan <- s.createRef(s.lastReadItem)
+	}
+}
+
+func (s *bufferState) handleTryGetOldest(respChan chan tryGetResult) {
+	if len(s.displayItems) > 0 {
+		itemToReturn := s.displayItems[0]
+		s.lastReadItem = itemToReturn
+		respChan <- tryGetResult{item: itemToReturn, ok: true}
+		if len(s.realItems) > 0 {
+			s.realItems = s.realItems[1:]
+		}
+		s.rebuildDisplayBuffer()
+	} else if s.opts.readContinuity && s.lastReadItem != nil {
+		// Buffer is empty, provide continuity item.
+		respChan <- tryGetResult{item: s.createRef(s.lastReadItem), ok: true}
+	} else {
+		// No items and no continuity possible, so fail the request.
+		respChan <- tryGetResult{item: nil, ok: false}
+	}
+}
+
+func (s *bufferState) handleGetAll(respChan chan []DataItem) {
+	if len(s.displayItems) == 0 {
+		respChan <- nil
+	} else {
+		respChan <- s.displayItems
+	}
+	// GetAll is a destructive read.
+	s.realItems = make([]DataItem, 0, s.size)
+	s.displayItems = make([]DataItem, 0, s.size)
+}
+
+func (s *bufferState) handleStreamSend() {
+	if len(s.displayItems) > 0 {
+		s.lastReadItem = s.displayItems[0]
+		// If we sent a real item, remove it from the source list.
+		if len(s.realItems) > 0 {
+			s.realItems = s.realItems[1:]
+		}
+	}
+	s.rebuildDisplayBuffer()
+}
+
+// --- Pure Functions ---
 
 // cleanup handles resource cleanup on shutdown.
 func cleanup(items []DataItem, streamChan chan<- DataItem) {
@@ -325,81 +350,100 @@ func applyDropStrategy(items []DataItem, size int, strategy DropStrategy) []Data
 	return items
 }
 
-// applyFillStrategy is a pure function that builds a new slice based on the fill strategy.
+// applyFillStrategy has been refactored to dispatch to smaller helper functions.
 func applyFillStrategy(items []DataItem, size int, strategy FillStrategy) []DataItem {
 	if len(items) == 0 || len(items) >= size {
 		return items
 	}
+	switch strategy {
+	case ResampleTimeline:
+		return fillResampleTimeline(items, size)
+	case PadWithNewest:
+		return fillPadWithNewest(items, size)
+	case FillLargestGap:
+		return fillLargestGap(items, size)
+	case NoFill:
+		// Do nothing
+	}
+	return items
+}
 
+func fillResampleTimeline(items []DataItem, size int) []DataItem {
+	resampled := make([]DataItem, 0, size)
+	numItems := len(items)
+	baseCount := size / numItems
+	extraCount := size % numItems
 	createRef := func(item DataItem) DataItem {
 		if ref, ok := item.(Referenceable); ok {
 			return ref.Ref()
 		}
 		return item
 	}
-
-	switch strategy {
-	case ResampleTimeline:
-		resampled := make([]DataItem, 0, size)
-		numItems := len(items)
-		baseCount := size / numItems
-		extraCount := size % numItems
-		for i, item := range items {
-			count := baseCount
-			if i < extraCount {
-				count++
-			}
-			for j := 0; j < count; j++ {
-				resampled = append(resampled, createRef(item))
-			}
+	for i, item := range items {
+		count := baseCount
+		if i < extraCount {
+			count++
 		}
-		return resampled
-
-	case PadWithNewest:
-		filledItems := make([]DataItem, len(items), size)
-		copy(filledItems, items)
-		newestItem := items[len(items)-1]
-		for i := len(items); i < size; i++ {
-			filledItems = append(filledItems, createRef(newestItem))
+		for j := 0; j < count; j++ {
+			resampled = append(resampled, createRef(item))
 		}
-		return filledItems
-
-	case FillLargestGap:
-		filledItems := make([]DataItem, len(items))
-		copy(filledItems, items)
-		for len(filledItems) < size {
-			if len(filledItems) < 2 {
-				if len(filledItems) == 1 {
-					filledItems = append(filledItems, createRef(filledItems[0]))
-					continue
-				}
-				break
-			}
-
-			var maxDiff time.Duration = -1
-			insertIndex := -1
-			for i := 0; i < len(filledItems)-1; i++ {
-				diff := filledItems[i+1].CreatedTime().Sub(filledItems[i].CreatedTime())
-				if diff > maxDiff {
-					maxDiff = diff
-					insertIndex = i + 1
-				}
-			}
-
-			if insertIndex != -1 {
-				itemToInsert := createRef(filledItems[insertIndex-1])
-				filledItems = append(filledItems[:insertIndex], append([]DataItem{itemToInsert}, filledItems[insertIndex:]...)...)
-			} else {
-				break
-			}
-		}
-		return filledItems
-
-	case NoFill:
-		// Do nothing.
 	}
-	return items
+	return resampled
 }
+
+func fillPadWithNewest(items []DataItem, size int) []DataItem {
+	filledItems := make([]DataItem, len(items), size)
+	copy(filledItems, items)
+	newestItem := items[len(items)-1]
+	createRef := func(item DataItem) DataItem {
+		if ref, ok := item.(Referenceable); ok {
+			return ref.Ref()
+		}
+		return item
+	}
+	for i := len(items); i < size; i++ {
+		filledItems = append(filledItems, createRef(newestItem))
+	}
+	return filledItems
+}
+
+func fillLargestGap(items []DataItem, size int) []DataItem {
+	filledItems := make([]DataItem, len(items))
+	copy(filledItems, items)
+	createRef := func(item DataItem) DataItem {
+		if ref, ok := item.(Referenceable); ok {
+			return ref.Ref()
+		}
+		return item
+	}
+	for len(filledItems) < size {
+		if len(filledItems) < 2 {
+			if len(filledItems) == 1 {
+				filledItems = append(filledItems, createRef(filledItems[0]))
+				continue
+			}
+			break
+		}
+		var maxDiff time.Duration = -1
+		insertIndex := -1
+		for i := 0; i < len(filledItems)-1; i++ {
+			diff := filledItems[i+1].CreatedTime().Sub(filledItems[i].CreatedTime())
+			if diff > maxDiff {
+				maxDiff = diff
+				insertIndex = i + 1
+			}
+		}
+		if insertIndex != -1 {
+			itemToInsert := createRef(filledItems[insertIndex-1])
+			filledItems = append(filledItems[:insertIndex], append([]DataItem{itemToInsert}, filledItems[insertIndex:]...)...)
+		} else {
+			break
+		}
+	}
+	return filledItems
+}
+
+// --- Public Methods ---
 
 // Close gracefully shuts down the buffer's manager goroutine. This method is idempotent
 // and is safe to call multiple times.
