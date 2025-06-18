@@ -4,6 +4,9 @@ Package temporalbuffer provides a thread-safe, fixed-size buffer for time-stampe
 designed to create a perfectly smooth, continuous stream from an irregular or
 bursty input.
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/jonoton/go-temporalbuffer.svg)](https://pkg.go.dev/github.com/jonoton/go-temporalbuffer)
+[![Go Report Card](https://goreportcard.com/badge/github.com/jonoton/go-temporalbuffer?)](https://goreportcard.com/report/github.com/jonoton/go-temporalbuffer)
+
 The buffer's core feature is "Timeline Resampling." By default, it intelligently
 fills empty space by proportionally representing the real items it contains. For example,
 if you have 2 items in a buffer of 10, the buffer will fill itself with 5 copies of
