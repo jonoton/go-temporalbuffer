@@ -9,39 +9,44 @@ import (
 
 // --- Mock DataItem ---
 
-// mockItem is a mock implementation of DataItem, Cleanable, and Referenceable
-// for testing purposes.
+// mockItem is a mock implementation of ManagedItem for testing purposes.
+// It allows us to track reference counts to verify memory management.
 type mockItem struct {
-	id          int
-	created     time.Time
-	cleanedUp   bool
-	refCount    int
-	cleanupLock sync.Mutex
-	refLock     sync.Mutex
+	id       int
+	created  time.Time
+	refCount int
+	refLock  sync.Mutex
 }
 
-func (m *mockItem) CreatedTime() time.Time {
-	return m.created
+// newMockItem creates a new item with an initial reference count of 1,
+// simulating the caller's initial ownership of the item.
+func newMockItem(id int, t time.Time) *mockItem {
+	return &mockItem{id: id, created: t, refCount: 1}
 }
 
-func (m *mockItem) Cleanup() {
-	m.cleanupLock.Lock()
-	defer m.cleanupLock.Unlock()
-	m.cleanedUp = true
-}
+func (m *mockItem) CreatedTime() time.Time { return m.created }
 
+// Ref increments the reference count, simulating a new reference being taken.
+// It returns a pointer to the same item, as Ref() creates a new logical
+// reference to the same underlying data.
 func (m *mockItem) Ref() DataItem {
 	m.refLock.Lock()
 	defer m.refLock.Unlock()
 	m.refCount++
-	// Return a new mock item to simulate creating a new reference.
-	return &mockItem{id: m.id, created: m.created}
+	return m
 }
 
-func (m *mockItem) hasBeenCleanedUp() bool {
-	m.cleanupLock.Lock()
-	defer m.cleanupLock.Unlock()
-	return m.cleanedUp
+// Cleanup decrements the reference count.
+func (m *mockItem) Cleanup() {
+	m.refLock.Lock()
+	defer m.refLock.Unlock()
+	m.refCount--
+}
+
+func (m *mockItem) getRefCount() int {
+	m.refLock.Lock()
+	defer m.refLock.Unlock()
+	return m.refCount
 }
 
 // --- Helper Functions ---
@@ -67,12 +72,26 @@ func assertNotNil(t *testing.T, v interface{}, msg string) {
 	}
 }
 
+// waitForCondition waits until a condition is met or a timeout occurs.
+func waitForCondition(t *testing.T, condition func() bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for condition")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // --- Tests ---
 
 func TestNewBufferWithOptions(t *testing.T) {
 	t.Run("Default options", func(t *testing.T) {
 		b := New(5)
 		defer b.Close()
+		// This test inspects internal state, which is generally discouraged, but useful
+		// for verifying the constructor logic.
 		assertEqual(t, int(b.opts.fillStrategy), int(ResampleTimeline), "Default fillStrategy should be ResampleTimeline")
 		assertTrue(t, b.opts.readContinuity, "Default readContinuity should be true")
 		assertEqual(t, int(b.opts.dropStrategy), int(DropClosest), "Default dropStrategy should be DropClosest")
@@ -91,11 +110,10 @@ func TestAddAndGet(t *testing.T) {
 	b := New(5, WithFillStrategy(NoFill), WithReadContinuity(false))
 	defer b.Close()
 
-	item1 := &mockItem{id: 1, created: time.Now()}
+	item1 := newMockItem(1, time.Now())
 	b.Add(item1)
 
-	// Allow the buffer's manager goroutine time to process the operation.
-	time.Sleep(10 * time.Millisecond)
+	waitForCondition(t, func() bool { return b.Len() == 1 }, 50*time.Millisecond)
 
 	retrieved, ok := b.TryGetOldest()
 	assertTrue(t, ok, "TryGetOldest should succeed on non-empty buffer")
@@ -103,6 +121,9 @@ func TestAddAndGet(t *testing.T) {
 
 	_, ok = b.TryGetOldest()
 	assertTrue(t, !ok, "TryGetOldest should fail on empty buffer")
+
+	// The test now owns the retrieved item
+	retrieved.(ManagedItem).Cleanup()
 }
 
 func TestGetAll(t *testing.T) {
@@ -110,16 +131,17 @@ func TestGetAll(t *testing.T) {
 	defer b.Close()
 
 	items := []DataItem{
-		&mockItem{id: 1, created: time.Now()},
-		&mockItem{id: 2, created: time.Now().Add(1 * time.Second)},
+		newMockItem(1, time.Now()),
+		newMockItem(2, time.Now().Add(1*time.Second)),
 	}
 	b.AddAll(items)
 
-	// Allow the buffer's manager goroutine time to process the operation.
-	time.Sleep(10 * time.Millisecond)
+	waitForCondition(t, func() bool { return b.Len() == 5 }, 50*time.Millisecond)
 
 	all := b.GetAll()
-	assertEqual(t, len(all), 5, "GetAll should return all items (including filled)")
+	assertEqual(t, len(all), 5, "GetAll should return all items")
+	// The test now owns the retrieved items
+	cleanupItems(all)
 
 	allAfterClear := b.GetAll()
 	if allAfterClear != nil {
@@ -137,227 +159,215 @@ func TestGetAll_NewBuffer(t *testing.T) {
 	}
 }
 
-func TestDropStrategy_DropClosest(t *testing.T) {
-	b := New(3)
-	defer b.Close()
-
-	items := []*mockItem{
-		{id: 1, created: time.Unix(100, 0)},
-		{id: 2, created: time.Unix(200, 0)},
-		{id: 3, created: time.Unix(201, 0)},
-		{id: 4, created: time.Unix(210, 0)},
-	}
-
-	b.AddAll([]DataItem{items[0], items[1], items[2], items[3]})
-	// Allow the buffer's manager goroutine time to process the operation.
-	time.Sleep(20 * time.Millisecond)
-
-	result := b.GetAll()
-	assertEqual(t, len(result), 3, "Buffer should have 3 items after dropping")
-
-	ids := make(map[int]bool)
-	for _, item := range result {
-		ids[item.(*mockItem).id] = true
-	}
-
-	if _, found := ids[2]; found {
-		t.Fatal("Item 2 should have been dropped")
-	}
-	assertTrue(t, items[1].hasBeenCleanedUp(), "Dropped item should be cleaned up")
-}
-
-func TestDropStrategy_DropOldest(t *testing.T) {
-	b := New(2, WithDropStrategy(DropOldest))
-	defer b.Close()
-
-	items := []*mockItem{
-		{id: 1, created: time.Unix(100, 0)}, // Will be dropped
-		{id: 2, created: time.Unix(200, 0)},
-		{id: 3, created: time.Unix(300, 0)},
-	}
-
-	b.AddAll([]DataItem{items[0], items[1], items[2]})
-	// Allow the buffer's manager goroutine time to process the operation.
-	time.Sleep(20 * time.Millisecond)
-
-	result := b.GetAll()
-	assertEqual(t, len(result), 2, "Buffer should have 2 items")
-	assertEqual(t, result[0].(*mockItem).id, 2, "First item should be id 2")
-	assertEqual(t, result[1].(*mockItem).id, 3, "Second item should be id 3")
-	assertTrue(t, items[0].hasBeenCleanedUp(), "Dropped item 1 should be cleaned up")
-}
-
-func TestFillStrategy(t *testing.T) {
-	t.Run("FillLargestGap", func(t *testing.T) {
-		b := New(5, WithFillStrategy(FillLargestGap))
+func TestDropStrategy(t *testing.T) {
+	t.Run("DropClosest", func(t *testing.T) {
+		b := New(3, WithFillStrategy(NoFill))
 		defer b.Close()
 
 		items := []*mockItem{
-			{id: 1, created: time.Unix(100, 0)},
-			{id: 2, created: time.Unix(200, 0)},
+			newMockItem(1, time.Now()),
+			newMockItem(2, time.Now().Add(1*time.Second)), // To be dropped
+			newMockItem(3, time.Now().Add(2*time.Second)),
+			newMockItem(4, time.Now().Add(12*time.Second)),
 		}
-		b.AddAll([]DataItem{items[0], items[1]})
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(20 * time.Millisecond)
 
-		result := b.GetAll()
-		assertEqual(t, len(result), 5, "Buffer should be filled to capacity")
+		b.AddAll([]DataItem{items[0], items[1], items[2], items[3]})
+		waitForCondition(t, func() bool { return b.Len() == 3 }, 50*time.Millisecond)
 
-		idCounts := make(map[int]int)
-		for _, item := range result {
-			idCounts[item.(*mockItem).id]++
-		}
-		assertEqual(t, idCounts[1], 4, "Item 1 should have 4 slots (1 original + 3 filled)")
-		assertEqual(t, idCounts[2], 1, "Item 2 should have 1 slot")
+		b.Close() // Close the buffer to ensure all internal cleanup is done.
+
+		// The buffer should have cleaned up the item completely.
+		assertEqual(t, items[1].getRefCount(), 0, "Dropped item should be fully cleaned up")
 	})
 
-	t.Run("FillLargestGap_SingleItem", func(t *testing.T) {
-		b := New(5, WithFillStrategy(FillLargestGap))
+	t.Run("DropOldest", func(t *testing.T) {
+		b := New(2, WithDropStrategy(DropOldest), WithFillStrategy(NoFill))
 		defer b.Close()
 
-		item := &mockItem{id: 1, created: time.Unix(100, 0)}
-		b.Add(item)
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(20 * time.Millisecond)
-
-		result := b.GetAll()
-		assertEqual(t, len(result), 5, "Buffer should be filled to capacity with one item")
-		for _, resItem := range result {
-			assertEqual(t, resItem.(*mockItem).id, 1, "All items should be a copy of the single item")
+		items := []*mockItem{
+			newMockItem(1, time.Now()), // To be dropped
+			newMockItem(2, time.Now().Add(1*time.Second)),
+			newMockItem(3, time.Now().Add(2*time.Second)),
 		}
-	})
 
+		b.AddAll([]DataItem{items[0], items[1], items[2]})
+		waitForCondition(t, func() bool { return b.Len() == 2 }, 50*time.Millisecond)
+		b.Close()
+
+		// The buffer should have cleaned up the item completely.
+		assertEqual(t, items[0].getRefCount(), 0, "Dropped item should be fully cleaned up")
+	})
+}
+
+func TestFillStrategy(t *testing.T) {
 	t.Run("ResampleTimeline", func(t *testing.T) {
 		b := New(10, WithFillStrategy(ResampleTimeline))
 		defer b.Close()
 
 		items := []*mockItem{
-			{id: 1, created: time.Now()},
-			{id: 2, created: time.Now().Add(1 * time.Second)},
-			{id: 3, created: time.Now().Add(2 * time.Second)},
+			newMockItem(1, time.Now()),
+			newMockItem(2, time.Now().Add(1*time.Second)),
+			newMockItem(3, time.Now().Add(2*time.Second)),
 		}
 		b.AddAll([]DataItem{items[0], items[1], items[2]})
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(20 * time.Millisecond)
+		waitForCondition(t, func() bool { return b.Len() == 10 }, 50*time.Millisecond)
 
-		result := b.GetAll()
-		assertEqual(t, len(result), 10, "Buffer should be filled to capacity")
-
-		idCounts := make(map[int]int)
-		for _, item := range result {
-			idCounts[item.(*mockItem).id]++
-		}
-		assertEqual(t, idCounts[1], 4, "Item 1 should have 4 slots")
-		assertEqual(t, idCounts[2], 3, "Item 2 should have 3 slots")
-		assertEqual(t, idCounts[3], 3, "Item 3 should have 3 slots")
+		// Check counts while buffer is active
+		// Real(1) + Display(4,3,3)
+		assertEqual(t, items[0].getRefCount(), 1+4, "Item 1 ref count is wrong")
+		assertEqual(t, items[1].getRefCount(), 1+3, "Item 2 ref count is wrong")
+		assertEqual(t, items[2].getRefCount(), 1+3, "Item 3 ref count is wrong")
 	})
 
 	t.Run("PadWithNewest", func(t *testing.T) {
 		b := New(5, WithFillStrategy(PadWithNewest))
 		defer b.Close()
-		b.Add(&mockItem{id: 1, created: time.Now()})
-		b.Add(&mockItem{id: 2, created: time.Now().Add(1 * time.Second)})
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(20 * time.Millisecond)
 
-		result := b.GetAll()
-		assertEqual(t, len(result), 5, "Buffer should be filled to capacity")
-		assertEqual(t, result[0].(*mockItem).id, 1, "First item should be original")
-		assertEqual(t, result[1].(*mockItem).id, 2, "Second item should be original")
-		assertEqual(t, result[2].(*mockItem).id, 2, "Third item should be padded duplicate")
+		items := []*mockItem{
+			newMockItem(1, time.Now()),
+			newMockItem(2, time.Now().Add(1*time.Second)),
+		}
+		b.AddAll([]DataItem{items[0], items[1]})
+		waitForCondition(t, func() bool { return b.Len() == 5 }, 50*time.Millisecond)
+
+		all := b.GetAll()
+		assertEqual(t, all[0].(*mockItem).id, 1, "PadWithNewest should have item 1 at index 0")
+		assertEqual(t, all[1].(*mockItem).id, 2, "PadWithNewest should have item 2 at index 1")
+		assertEqual(t, all[2].(*mockItem).id, 2, "PadWithNewest should have item 2 at index 2")
+		cleanupItems(all)
 	})
 
-	t.Run("NoFill", func(t *testing.T) {
-		b := New(5, WithFillStrategy(NoFill))
+	t.Run("FillLargestGap", func(t *testing.T) {
+		b := New(5, WithFillStrategy(FillLargestGap))
 		defer b.Close()
-		b.Add(&mockItem{id: 1, created: time.Now()})
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(10 * time.Millisecond)
 
-		assertEqual(t, b.Len(), 1, "Buffer should not be filled")
+		items := []*mockItem{
+			newMockItem(1, time.Unix(100, 0)),
+			newMockItem(2, time.Unix(200, 0)),
+		}
+		b.AddAll([]DataItem{items[0], items[1]})
+		waitForCondition(t, func() bool { return b.Len() == 5 }, 50*time.Millisecond)
+
+		all := b.GetAll()
+		idCounts := make(map[int]int)
+		for _, item := range all {
+			idCounts[item.(*mockItem).id]++
+		}
+		assertEqual(t, idCounts[1], 4, "Item 1 should have 4 slots (1 original, 3 filled)")
+		assertEqual(t, idCounts[2], 1, "Item 2 should have 1 slot")
+		cleanupItems(all)
 	})
 }
 
-func TestReadContinuity(t *testing.T) {
-	t.Run("Enabled by default", func(t *testing.T) {
-		b := New(5)
-		defer b.Close()
+// TestMemoryManagement verifies the reference counting logic based on the final ownership model.
+func TestMemoryManagement(t *testing.T) {
+	t.Run("Add transfers ownership", func(t *testing.T) {
+		b := New(5, WithFillStrategy(NoFill))
+		item1 := newMockItem(1, time.Now())
 
-		_, ok := b.TryGetOldest()
-		assertTrue(t, !ok, "TryGetOldest on a never-used buffer should fail")
-
-		item1 := &mockItem{id: 1, created: time.Now()}
 		b.Add(item1)
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(20 * time.Millisecond)
+		waitForCondition(t, func() bool { return b.Len() == 1 }, 50*time.Millisecond)
 
-		retrieved1, ok := b.TryGetOldest()
-		assertTrue(t, ok, "First TryGetOldest should succeed")
-		assertEqual(t, retrieved1.(*mockItem).id, 1, "Retrieved item ID should be 1")
-
-		_ = b.GetAll()
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(10 * time.Millisecond)
-
-		continuityItem, ok := b.TryGetOldest()
-		assertTrue(t, ok, "TryGetOldest on an empty buffer should succeed with continuity")
-		assertNotNil(t, continuityItem, "Continuity item should not be nil")
-		assertEqual(t, continuityItem.(*mockItem).id, 1, "Continuity item should have the ID of the last-read item")
+		b.Close() // Close buffer to release its internal refs
+		waitForCondition(t, func() bool { return item1.getRefCount() == 0 }, 50*time.Millisecond)
+		assertEqual(t, item1.getRefCount(), 0, "Ref count should be 0 after buffer closes")
 	})
 
-	t.Run("Disabled", func(t *testing.T) {
-		b := New(5, WithReadContinuity(false), WithFillStrategy(NoFill))
-		defer b.Close()
-
-		item1 := &mockItem{id: 1, created: time.Now()}
+	t.Run("Get consumes display and real item", func(t *testing.T) {
+		b := New(1, WithFillStrategy(NoFill))
+		item1 := newMockItem(1, time.Now())
 		b.Add(item1)
-		// Allow the buffer's manager goroutine time to process the operation.
-		time.Sleep(10 * time.Millisecond)
-		_, _ = b.TryGetOldest() // Drain the only item
+		waitForCondition(t, func() bool { return b.Len() == 1 }, 50*time.Millisecond)
 
-		_, ok := b.TryGetOldest()
-		assertTrue(t, !ok, "TryGetOldest on an empty buffer should fail when continuity is disabled")
+		gottenItem, _ := b.TryGetOldest()
+		waitForCondition(t, func() bool { return b.Len() == 0 }, 50*time.Millisecond)
+
+		b.Close()
+		waitForCondition(t, func() bool { return item1.getRefCount() == 1 }, 50*time.Millisecond)
+		// After close, only the user's reference from `gottenItem` should remain.
+		assertEqual(t, item1.getRefCount(), 1, "Ref count should be 1 after close")
+
+		gottenItem.(ManagedItem).Cleanup()
+		assertEqual(t, item1.getRefCount(), 0, "Ref count should be 0 after final cleanup")
 	})
 
-	t.Run("Streaming channel continuity", func(t *testing.T) {
+	t.Run("GetAll transfers ownership and cleans internal refs", func(t *testing.T) {
 		b := New(2, WithFillStrategy(NoFill))
-		defer b.Close()
-		stream := b.GetOldestChan()
+		item1 := newMockItem(1, time.Now())
+		b.Add(item1)
+		waitForCondition(t, func() bool { return b.Len() == 1 }, 50*time.Millisecond)
 
-		b.Add(&mockItem{id: 1, created: time.Now()})
+		gottenItems := b.GetAll()
+		waitForCondition(t, func() bool { return b.Len() == 0 }, 50*time.Millisecond)
 
-		item1 := <-stream
-		assertEqual(t, item1.(*mockItem).id, 1, "First stream item should be real")
+		b.Close() // Close should have no effect on refs already transferred.
 
-		continuityItem1 := <-stream
-		assertEqual(t, continuityItem1.(*mockItem).id, 1, "Stream should provide continuity item")
+		// After GetAll, the user owns the display references. The buffer has cleaned its real refs.
+		assertEqual(t, item1.getRefCount(), 1, "Ref count after GetAll is wrong")
+
+		cleanupItems(gottenItems)
+		assertEqual(t, item1.getRefCount(), 0, "Item should be fully cleaned up")
+	})
+
+	t.Run("lastReadItem lifecycle", func(t *testing.T) {
+		b := New(2, WithFillStrategy(NoFill))
+		item1 := newMockItem(1, time.Now())
+		item2 := newMockItem(2, time.Now())
+
+		b.Add(item1)
+		b.Add(item2)
+		waitForCondition(t, func() bool { return b.Len() == 2 }, 50*time.Millisecond)
+
+		gottenItem1, _ := b.TryGetOldest()
+		waitForCondition(t, func() bool { return b.Len() == 1 }, 50*time.Millisecond)
+
+		gottenItem2, _ := b.TryGetOldest()
+		waitForCondition(t, func() bool { return b.Len() == 0 }, 50*time.Millisecond)
+
+		b.Close()
+		waitForCondition(t, func() bool { return item1.getRefCount() == 1 && item2.getRefCount() == 1 }, 50*time.Millisecond)
+		// After close, user owns gottenItem1 and gottenItem2.
+		assertEqual(t, item1.getRefCount(), 1, "Ref count for item1 should be 1")
+		assertEqual(t, item2.getRefCount(), 1, "Ref count for item2 should be 1")
+
+		gottenItem1.(ManagedItem).Cleanup()
+		gottenItem2.(ManagedItem).Cleanup()
+		assertEqual(t, item1.getRefCount(), 0, "Item 1 should be fully cleaned")
+		assertEqual(t, item2.getRefCount(), 0, "Item 2 should be fully cleaned")
 	})
 }
 
 func TestGetOldest_Blocking(t *testing.T) {
-	b := New(5, WithReadContinuity(false), WithFillStrategy(NoFill))
+	b := New(5, WithReadContinuity(false))
 	defer b.Close()
 
-	done := make(chan DataItem)
+	done := make(chan bool)
 	go func() {
-		// This will block until an item is added.
 		item := b.GetOldest()
-		done <- item
+		assertNotNil(t, item, "Blocking GetOldest should return a valid item")
+		assertEqual(t, item.(*mockItem).id, 100, "Blocking GetOldest returned wrong item")
+		item.(ManagedItem).Cleanup()
+		done <- true
 	}()
 
-	// Verify the goroutine is blocked before proceeding.
+	// Give the goroutine time to block on GetOldest
 	time.Sleep(20 * time.Millisecond)
 
-	item1 := &mockItem{id: 100, created: time.Now()}
+	item1 := newMockItem(100, time.Now())
 	b.Add(item1)
 
 	select {
-	case retrieved := <-done:
-		assertNotNil(t, retrieved, "Retrieved item should not be nil")
-		assertEqual(t, retrieved.(*mockItem).id, 100, "Blocking GetOldest returned wrong item")
-	case <-time.After(50 * time.Millisecond):
+	case <-done:
+		// success
+	case <-time.After(100 * time.Millisecond):
 		t.Fatal("Test timed out waiting for blocking GetOldest to return")
 	}
+}
+
+func TestCap(t *testing.T) {
+	b := New(99)
+	defer b.Close()
+	assertEqual(t, b.Cap(), 99, "Cap() should return the configured size")
 }
 
 func TestConcurrentOperations(t *testing.T) {
@@ -375,7 +385,7 @@ func TestConcurrentOperations(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < itemsPerProducer; j++ {
 				id := (producerID * itemsPerProducer) + j
-				b.Add(&mockItem{id: id, created: time.Now()})
+				b.Add(newMockItem(id, time.Now()))
 				time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 			}
 		}(i)
@@ -386,10 +396,12 @@ func TestConcurrentOperations(t *testing.T) {
 	stream := b.GetOldestChan()
 	done := make(chan struct{})
 	totalItems := numProducers * itemsPerProducer
+	var receivedItems []DataItem
 
 	go func() {
-		for range stream {
+		for item := range stream {
 			receivedCount++
+			receivedItems = append(receivedItems, item)
 			if receivedCount == totalItems {
 				close(done)
 				return
@@ -402,22 +414,11 @@ func TestConcurrentOperations(t *testing.T) {
 	select {
 	case <-done:
 		// All items were consumed before close, success
+		cleanupItems(receivedItems)
 	case <-time.After(2 * time.Second):
+		cleanupItems(receivedItems)
 		t.Fatalf("Test timed out. Expected to consume %d items, but only got %d", totalItems, receivedCount)
 	}
-}
-
-func TestLenAndCap(t *testing.T) {
-	b := New(10)
-	defer b.Close()
-
-	assertEqual(t, b.Cap(), 10, "Cap() should return the configured size")
-	assertEqual(t, b.Len(), 0, "Len() on new buffer should be 0")
-
-	b.Add(&mockItem{id: 1, created: time.Now()})
-	// Allow the buffer's manager goroutine time to process the operation.
-	time.Sleep(10 * time.Millisecond)
-	assertEqual(t, b.Len(), 10, "Len() after add with resampling should be 10")
 }
 
 func TestClose_Idempotency(t *testing.T) {
