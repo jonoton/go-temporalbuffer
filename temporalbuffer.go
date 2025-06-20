@@ -70,33 +70,33 @@ func WithDropStrategy(strategy DropStrategy) Option {
 
 // --- Interfaces ---
 
-// DataItem is the required interface for any item stored in the buffer.
+// DataItem is the constraint that all items stored in the buffer must satisfy.
 type DataItem interface {
 	CreatedTime() time.Time
 }
 
 // ManagedItem is an optional interface for items that require reference counting
-// and cleanup logic. A type that can be referenced should also be cleanable.
-type ManagedItem interface {
-	DataItem
-	Ref() DataItem // Should increment a reference count and return a new reference.
-	Cleanup()      // Should decrement a reference count and free resources if the count is zero.
+// and cleanup logic. The generic type T ensures that Ref() returns the concrete type.
+type ManagedItem[T DataItem] interface {
+	DataItem  // Embed the constraint interface.
+	Ref() T   // Should increment a reference count and return a new reference.
+	Cleanup() // Should decrement a reference count and free resources if the count is zero.
 }
 
 // --- Internal Types ---
 
-type tryGetResult struct {
-	item DataItem
+type tryGetResult[T DataItem] struct {
+	item T
 	ok   bool
 }
 
 // bufferState holds the internal, mutable state of the buffer.
-type bufferState struct {
-	realItems        []DataItem
-	displayItems     []DataItem
+type bufferState[T DataItem] struct {
+	realItems        []T
+	displayItems     []T
 	displayMap       []int // Maps displayItems back to the index of their source realItem
-	lastReadItem     DataItem
-	streamOutputChan chan<- DataItem
+	lastReadItem     T
+	streamOutputChan chan<- T
 	opts             options
 	size             int
 }
@@ -104,24 +104,26 @@ type bufferState struct {
 // --- Buffer Implementation ---
 
 // Buffer is a thread-safe, fixed-size buffer for time-stamped data.
-type Buffer struct {
+// It is generic and can hold any type that satisfies the DataItem interface.
+type Buffer[T DataItem] struct {
 	size               int
 	opts               options
-	state              *bufferState // The internal state, confined to the run() goroutine.
-	wg                 sync.WaitGroup
-	addChan            chan DataItem
-	addAllChan         chan []DataItem
-	getOldestChan      chan chan DataItem
-	tryGetOldestChan   chan chan tryGetResult
-	getAllChan         chan chan []DataItem
-	registerStreamChan chan chan DataItem
+	state              *bufferState[T] // The internal state, confined to the run() goroutine.
+	done               chan struct{}
+	addChan            chan T
+	addAllChan         chan []T
+	getOldestChan      chan chan T
+	tryGetOldestChan   chan chan tryGetResult[T]
+	getAllChan         chan chan []T
+	registerStreamChan chan chan T
 	lenChan            chan chan int
 	quitChan           chan struct{}
 	closeOnce          sync.Once
 }
 
-// New creates a new Buffer with the given size and optional configurations.
-func New(size int, opts ...Option) *Buffer {
+// New creates a new Buffer for a specific type T with the given size and optional configurations.
+// The type T must satisfy the DataItem interface.
+func New[T DataItem](size int, opts ...Option) *Buffer[T] {
 	cfg := options{
 		fillStrategy:   ResampleTimeline,
 		readContinuity: true,
@@ -131,40 +133,41 @@ func New(size int, opts ...Option) *Buffer {
 		opt(&cfg)
 	}
 
-	b := &Buffer{
+	b := &Buffer[T]{
 		size: size,
 		opts: cfg,
-		state: &bufferState{
-			realItems: make([]DataItem, 0, size),
+		state: &bufferState[T]{
+			realItems: make([]T, 0, size),
 			opts:      cfg,
 			size:      size,
 		},
-		addChan:            make(chan DataItem),
-		addAllChan:         make(chan []DataItem),
-		getOldestChan:      make(chan chan DataItem),
-		tryGetOldestChan:   make(chan chan tryGetResult),
-		getAllChan:         make(chan chan []DataItem),
-		registerStreamChan: make(chan chan DataItem),
+		addChan:            make(chan T),
+		addAllChan:         make(chan []T),
+		getOldestChan:      make(chan chan T),
+		tryGetOldestChan:   make(chan chan tryGetResult[T]),
+		getAllChan:         make(chan chan []T),
+		registerStreamChan: make(chan chan T),
 		lenChan:            make(chan chan int),
 		quitChan:           make(chan struct{}),
+		done:               make(chan struct{}),
 	}
-	b.wg.Add(1)
 	go b.run()
 	return b
 }
 
 // run is the manager goroutine that owns and manages the buffer state.
-func (b *Buffer) run() {
-	defer b.wg.Done()
+func (b *Buffer[T]) run() {
+	defer close(b.done)
 	state := b.state
+	var zeroValue T // The zero value for type T (e.g., nil for pointers)
 
 	for {
-		var oldestChan chan chan DataItem
-		var streamChan chan<- DataItem
-		var streamValue DataItem
+		var oldestChan chan chan T
+		var streamChan chan<- T
+		var streamValue T
 
 		lastReadItemCreatedReference := false
-		canServe := len(state.displayItems) > 0 || (state.opts.readContinuity && state.lastReadItem != nil)
+		canServe := len(state.displayItems) > 0 || (state.opts.readContinuity && any(state.lastReadItem) != any(zeroValue))
 		if canServe {
 			oldestChan = b.getOldestChan
 			streamChan = state.streamOutputChan
@@ -229,7 +232,7 @@ func (b *Buffer) run() {
 				state.handleAdd(item)
 				state.handleGetOldest(respChan)
 			case respChan := <-b.tryGetOldestChan:
-				respChan <- tryGetResult{item: nil, ok: false}
+				respChan <- tryGetResult[T]{item: zeroValue, ok: false}
 			case respChan := <-b.getAllChan:
 				respChan <- nil
 			case reqChan := <-b.registerStreamChan:
@@ -250,38 +253,36 @@ func (b *Buffer) run() {
 
 // rebuildDisplayBuffer recalculates the user-facing slice based on the real items
 // and the configured drop/fill strategies.
-func (s *bufferState) rebuildDisplayBuffer() {
+func (s *bufferState[T]) rebuildDisplayBuffer() {
 	// 1. Clean up old display items before creating new ones.
 	cleanupItems(s.displayItems)
-
 	// 2. Determine the new set of real items after dropping.
 	s.realItems = applyDropStrategy(s.realItems, s.size, s.opts.dropStrategy)
-
 	// 3. Generate the new display items and their map from the real items.
 	s.displayItems, s.displayMap = applyFillStrategy(s.realItems, s.size, s.opts.fillStrategy)
 }
 
 // setLastReadItem correctly manages the lifecycle of the continuity item.
-func (s *bufferState) setLastReadItem(item DataItem) {
+func (s *bufferState[T]) setLastReadItem(item T) {
 	cleanupItem(s.lastReadItem)
 	s.lastReadItem = createItemRef(item)
 }
 
 // handleAdd takes ownership of the incoming item and rebuilds the display.
-func (s *bufferState) handleAdd(item DataItem) {
+func (s *bufferState[T]) handleAdd(item T) {
 	s.realItems = append(s.realItems, item)
 	s.rebuildDisplayBuffer()
 }
 
 // handleAddAll takes ownership of all incoming items and rebuilds the display.
-func (s *bufferState) handleAddAll(items []DataItem) {
+func (s *bufferState[T]) handleAddAll(items []T) {
 	s.realItems = append(s.realItems, items...)
 	s.rebuildDisplayBuffer()
 }
 
 // consumeAndCheckRealItem determines if a real item is no longer represented
 // in the display and can be safely cleaned up and removed.
-func (s *bufferState) consumeAndCheckRealItem(consumedIndex int) {
+func (s *bufferState[T]) consumeAndCheckRealItem(consumedIndex int) {
 	if consumedIndex < 0 || consumedIndex >= len(s.realItems) {
 		return
 	}
@@ -308,7 +309,7 @@ func (s *bufferState) consumeAndCheckRealItem(consumedIndex int) {
 }
 
 // handleGetOldest handles a blocking get request.
-func (s *bufferState) handleGetOldest(respChan chan DataItem) {
+func (s *bufferState[T]) handleGetOldest(respChan chan T) {
 	if len(s.displayItems) > 0 {
 		itemToReturn := s.displayItems[0]
 		consumedRealItemIndex := s.displayMap[0]
@@ -327,7 +328,7 @@ func (s *bufferState) handleGetOldest(respChan chan DataItem) {
 }
 
 // handleTryGetOldest handles a non-blocking get request.
-func (s *bufferState) handleTryGetOldest(respChan chan tryGetResult) {
+func (s *bufferState[T]) handleTryGetOldest(respChan chan tryGetResult[T]) {
 	if len(s.displayItems) > 0 {
 		itemToReturn := s.displayItems[0]
 		consumedRealItemIndex := s.displayMap[0]
@@ -338,16 +339,16 @@ func (s *bufferState) handleTryGetOldest(respChan chan tryGetResult) {
 		s.consumeAndCheckRealItem(consumedRealItemIndex)
 		s.setLastReadItem(itemToReturn)
 
-		respChan <- tryGetResult{item: itemToReturn, ok: true}
-	} else if s.opts.readContinuity && s.lastReadItem != nil {
-		respChan <- tryGetResult{item: createItemRef(s.lastReadItem), ok: true}
+		respChan <- tryGetResult[T]{item: itemToReturn, ok: true}
+	} else if s.opts.readContinuity && any(s.lastReadItem) != any(*new(T)) {
+		respChan <- tryGetResult[T]{item: createItemRef(s.lastReadItem), ok: true}
 	} else {
-		respChan <- tryGetResult{item: nil, ok: false}
+		respChan <- tryGetResult[T]{item: *new(T), ok: false}
 	}
 }
 
 // handleGetAll transfers ownership of all display items and cleans up internal state.
-func (s *bufferState) handleGetAll(respChan chan []DataItem) {
+func (s *bufferState[T]) handleGetAll(respChan chan []T) {
 	if len(s.displayItems) == 0 {
 		respChan <- nil
 	} else {
@@ -357,13 +358,13 @@ func (s *bufferState) handleGetAll(respChan chan []DataItem) {
 	// responsible for them. However, it is discarding its internal list of
 	// real items, so it must clean up those references.
 	cleanupItems(s.realItems)
-	s.realItems = make([]DataItem, 0, s.size)
+	s.realItems = make([]T, 0, s.size)
 	s.displayItems = nil
 	s.displayMap = nil
 }
 
 // handleStreamSend consumes the oldest item for the streaming channel.
-func (s *bufferState) handleStreamSend() {
+func (s *bufferState[T]) handleStreamSend() {
 	if len(s.displayItems) > 0 {
 		itemSent := s.displayItems[0]
 		consumedRealItemIndex := s.displayMap[0]
@@ -380,35 +381,41 @@ func (s *bufferState) handleStreamSend() {
 // --- Pure Functions ---
 
 // cleanupItem handles resource cleanup for a single item.
-func cleanupItem(item DataItem) {
-	if m, ok := item.(ManagedItem); ok {
-		m.Cleanup()
+func cleanupItem[T DataItem](item T) {
+	var zeroValue T
+	if any(item) == any(zeroValue) {
+		return
+	}
+	if managed, ok := any(item).(ManagedItem[T]); ok {
+		managed.Cleanup()
 	}
 }
 
 // cleanupItems handles resource cleanup for a slice of items.
-func cleanupItems(items []DataItem) {
+func cleanupItems[T DataItem](items []T) {
 	for _, item := range items {
 		cleanupItem(item)
 	}
 }
 
 // createItemRef is a pure helper to safely call the Ref() method.
-func createItemRef(item DataItem) DataItem {
-	if m, ok := item.(ManagedItem); ok {
-		return m.Ref()
+func createItemRef[T DataItem](item T) T {
+	var zeroValue T
+	if any(item) == any(zeroValue) {
+		return zeroValue
+	}
+	if managed, ok := any(item).(ManagedItem[T]); ok {
+		return managed.Ref()
 	}
 	return item
 }
 
 // applyDropStrategy is a pure function that sorts and drops items if over capacity.
-func applyDropStrategy(items []DataItem, size int, strategy DropStrategy) []DataItem {
+func applyDropStrategy[T DataItem](items []T, size int, strategy DropStrategy) []T {
 	if len(items) <= size {
 		return items
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].CreatedTime().Before(items[j].CreatedTime())
-	})
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedTime().Before(items[j].CreatedTime()) })
 	switch strategy {
 	case DropOldest:
 		droppedCount := len(items) - size
@@ -442,12 +449,12 @@ func applyDropStrategy(items []DataItem, size int, strategy DropStrategy) []Data
 }
 
 // applyFillStrategy generates a new display slice and its corresponding map.
-func applyFillStrategy(items []DataItem, size int, strategy FillStrategy) ([]DataItem, []int) {
+func applyFillStrategy[T DataItem](items []T, size int, strategy FillStrategy) ([]T, []int) {
 	if len(items) == 0 {
 		return nil, nil
 	}
 	if len(items) >= size {
-		display := make([]DataItem, len(items))
+		display := make([]T, len(items))
 		displayMap := make([]int, len(items))
 		for i, item := range items {
 			display[i] = createItemRef(item)
@@ -455,7 +462,6 @@ func applyFillStrategy(items []DataItem, size int, strategy FillStrategy) ([]Dat
 		}
 		return display, displayMap
 	}
-
 	switch strategy {
 	case ResampleTimeline:
 		return fillResampleTimeline(items, size)
@@ -463,12 +469,10 @@ func applyFillStrategy(items []DataItem, size int, strategy FillStrategy) ([]Dat
 		return fillPadWithNewest(items, size)
 	case FillLargestGap:
 		return fillLargestGap(items, size)
-	case NoFill:
-		// Fallthrough
+	case NoFill: // Fallthrough
 	}
-
 	// For NoFill, we still need to create references for the items that are present.
-	display := make([]DataItem, len(items))
+	display := make([]T, len(items))
 	displayMap := make([]int, len(items))
 	for i, item := range items {
 		display[i] = createItemRef(item)
@@ -478,8 +482,8 @@ func applyFillStrategy(items []DataItem, size int, strategy FillStrategy) ([]Dat
 }
 
 // fillResampleTimeline generates a display slice using proportional representation.
-func fillResampleTimeline(items []DataItem, size int) ([]DataItem, []int) {
-	resampled := make([]DataItem, 0, size)
+func fillResampleTimeline[T DataItem](items []T, size int) ([]T, []int) {
+	resampled := make([]T, 0, size)
 	resampledMap := make([]int, 0, size)
 	numItems := len(items)
 	baseCount := size / numItems
@@ -498,14 +502,13 @@ func fillResampleTimeline(items []DataItem, size int) ([]DataItem, []int) {
 }
 
 // fillPadWithNewest generates a display slice by padding with the newest item.
-func fillPadWithNewest(items []DataItem, size int) ([]DataItem, []int) {
-	filledItems := make([]DataItem, 0, size)
+func fillPadWithNewest[T DataItem](items []T, size int) ([]T, []int) {
+	filledItems := make([]T, 0, size)
 	filledMap := make([]int, 0, size)
 	for i, item := range items {
 		filledItems = append(filledItems, createItemRef(item))
 		filledMap = append(filledMap, i)
 	}
-
 	newestItem := items[len(items)-1]
 	newestItemIndex := len(items) - 1
 	for i := len(items); i < size; i++ {
@@ -516,14 +519,13 @@ func fillPadWithNewest(items []DataItem, size int) ([]DataItem, []int) {
 }
 
 // fillLargestGap generates a display slice by filling the largest time gaps.
-func fillLargestGap(items []DataItem, size int) ([]DataItem, []int) {
-	filledItems := make([]DataItem, 0, size)
+func fillLargestGap[T DataItem](items []T, size int) ([]T, []int) {
+	filledItems := make([]T, 0, size)
 	filledMap := make([]int, 0, size)
 	for i, item := range items {
 		filledItems = append(filledItems, createItemRef(item))
 		filledMap = append(filledMap, i)
 	}
-
 	for len(filledItems) < size {
 		if len(filledItems) < 2 {
 			if len(filledItems) == 1 {
@@ -545,7 +547,7 @@ func fillLargestGap(items []DataItem, size int) ([]DataItem, []int) {
 		if insertIndex != -1 {
 			itemToInsert := createItemRef(filledItems[insertIndex-1])
 			realItemIndex := filledMap[insertIndex-1]
-			filledItems = append(filledItems[:insertIndex], append([]DataItem{itemToInsert}, filledItems[insertIndex:]...)...)
+			filledItems = append(filledItems[:insertIndex], append([]T{itemToInsert}, filledItems[insertIndex:]...)...)
 			filledMap = append(filledMap[:insertIndex], append([]int{realItemIndex}, filledMap[insertIndex:]...)...)
 		} else {
 			break
@@ -558,60 +560,54 @@ func fillLargestGap(items []DataItem, size int) ([]DataItem, []int) {
 
 // Close gracefully shuts down the buffer's manager goroutine. This method is idempotent
 // and blocking, ensuring all resources are released before it returns.
-func (b *Buffer) Close() {
+func (b *Buffer[T]) Close() {
 	b.closeOnce.Do(func() {
 		close(b.quitChan)
 	})
-	b.wg.Wait()
+	<-b.done
 }
 
 // Add sends a request to add a single item to the buffer.
-func (b *Buffer) Add(item DataItem) {
-	b.addChan <- item
-}
+func (b *Buffer[T]) Add(item T) { b.addChan <- item }
 
 // AddAll sends a request to add multiple items to the buffer.
-func (b *Buffer) AddAll(items []DataItem) {
-	b.addAllChan <- items
-}
+func (b *Buffer[T]) AddAll(items []T) { b.addAllChan <- items }
 
 // GetOldest retrieves the oldest item from the display buffer.
-func (b *Buffer) GetOldest() DataItem {
-	respChan := make(chan DataItem)
+func (b *Buffer[T]) GetOldest() T {
+	respChan := make(chan T)
 	b.getOldestChan <- respChan
 	return <-respChan
 }
 
 // TryGetOldest attempts to retrieve the oldest item without blocking.
-func (b *Buffer) TryGetOldest() (DataItem, bool) {
-	respChan := make(chan tryGetResult)
+func (b *Buffer[T]) TryGetOldest() (T, bool) {
+	respChan := make(chan tryGetResult[T])
 	b.tryGetOldestChan <- respChan
 	result := <-respChan
 	return result.item, result.ok
 }
 
 // GetOldestChan returns a read-only channel for continuous item consumption.
-func (b *Buffer) GetOldestChan() <-chan DataItem {
-	streamChan := make(chan DataItem, b.size)
+func (b *Buffer[T]) GetOldestChan() <-chan T {
+	streamChan := make(chan T, b.size)
 	b.registerStreamChan <- streamChan
 	return streamChan
 }
 
 // GetAll returns a slice of all items currently in the display buffer and clears the buffer.
-func (b *Buffer) GetAll() []DataItem {
-	respChan := make(chan []DataItem)
+func (b *Buffer[T]) GetAll() []T {
+	respChan := make(chan []T)
 	b.getAllChan <- respChan
 	return <-respChan
 }
 
 // Len returns the current number of items in the display buffer.
-func (b *Buffer) Len() int {
+func (b *Buffer[T]) Len() int {
 	respChan := make(chan int)
 	b.lenChan <- respChan
 	return <-respChan
 }
 
 // Cap returns the configured capacity of the buffer.
-func (b *Buffer) Cap() int {
-	return b.size
-}
+func (b *Buffer[T]) Cap() int { return b.size }
