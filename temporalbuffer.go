@@ -240,6 +240,7 @@ func (b *Buffer[T]) run() {
 			case respChan := <-b.lenChan:
 				respChan <- 0
 			case <-b.quitChan:
+				cleanupItem(state.lastReadItem)
 				if state.streamOutputChan != nil {
 					close(state.streamOutputChan)
 				}
