@@ -257,8 +257,8 @@ func (b *Buffer[T]) run() {
 func (s *bufferState[T]) rebuildDisplayBuffer() {
 	// 1. Clean up old display items before creating new ones.
 	cleanupItems(s.displayItems)
-	// 2. Determine the new set of real items after dropping.
-	s.realItems = applyDropStrategy(s.realItems, s.size, s.opts.dropStrategy)
+	// 2. Sort and determine the new set of real items after dropping.
+	s.realItems = sortAndApplyDropStrategy(s.realItems, s.size, s.opts.dropStrategy)
 	// 3. Generate the new display items and their map from the real items.
 	s.displayItems, s.displayMap = applyFillStrategy(s.realItems, s.size, s.opts.fillStrategy)
 }
@@ -411,12 +411,12 @@ func createItemRef[T DataItem](item T) T {
 	return item
 }
 
-// applyDropStrategy is a pure function that sorts and drops items if over capacity.
-func applyDropStrategy[T DataItem](items []T, size int, strategy DropStrategy) []T {
+// sortAndApplyDropStrategy is a pure function that sorts and drops items if over capacity.
+func sortAndApplyDropStrategy[T DataItem](items []T, size int, strategy DropStrategy) []T {
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedTime().Before(items[j].CreatedTime()) })
 	if len(items) <= size {
 		return items
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].CreatedTime().Before(items[j].CreatedTime()) })
 	switch strategy {
 	case DropOldest:
 		droppedCount := len(items) - size
